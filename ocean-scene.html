@@ -36,7 +36,7 @@
     <div class="slider-group"><label>Wave Height <span class="value" id="valHeight">1.0</span></label><input type="range" id="sliderHeight" min="0" max="3" step="0.05" value="1.0"></div>
     <div class="slider-group"><label>Wave Speed <span class="value" id="valSpeed">1.0</span></label><input type="range" id="sliderSpeed" min="0.1" max="3" step="0.05" value="1.0"></div>
     <div class="slider-group"><label>Wave Frequency <span class="value" id="valFreq">1.0</span></label><input type="range" id="sliderFreq" min="0.2" max="3" step="0.05" value="1.0"></div>
-    <div class="slider-group"><label>Break Distance <span class="value" id="valBreak">3.0</span></label><input type="range" id="sliderBreak" min="1" max="25" step="0.5" value="3.0"></div>
+    <div class="slider-group"><label>Break Distance <span class="value" id="valBreak">7.0</span></label><input type="range" id="sliderBreak" min="2" max="18" step="0.5" value="7.0"></div>
     <div class="divider"></div>
     <div class="hint">🖱 Drag to orbit • Scroll to zoom • R to reset</div>
   </div>
@@ -56,7 +56,7 @@
     waveHeight: 1.0,
     waveSpeed: 1.0,
     waveFrequency: 1.0,
-    breakDistance: 3.0,
+    breakDistance: 7.0,
     };
 
     // ===================================================================
@@ -222,6 +222,7 @@
       map: foamTex,
       transparent: true,
       vertexColors: true,
+      opacity: 0.95,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
     });
@@ -238,6 +239,27 @@
     // SMOOTHSTEP HELPER
     // ===================================================================
     function smoothstep(a,b,x){const t=Math.max(0,Math.min(1,(x-a)/(b-a)));return t*t*(3-2*t);}
+
+    function getBreaker(wx, wz, dist, time, breakDistance) {
+      const sidePhase = wx * 0.052 - time * CONFIG.waveSpeed * 0.72
+      const peel = 0.3 + 0.7 * smoothstep(-0.35, 0.7, Math.sin(sidePhase))
+      const breakLine = breakDistance * (0.88 + Math.sin(wx * 0.035) * 0.13)
+      const zoneWidth = Math.max(1.2, breakDistance * 0.32)
+      const zone = Math.exp(-Math.pow((dist - breakLine) / zoneWidth, 2))
+      const phase = wz * 0.68 + wx * 0.045 - time * CONFIG.waveSpeed * 0.92
+      const wrapped = Math.atan2(Math.sin(phase), Math.cos(phase))
+      const crest = Math.exp(-wrapped * wrapped * 5.5)
+      const backwash = Math.exp(-Math.pow(wrapped - 0.7, 2) * 3.5)
+      const active = dist > 0 && dist < SHOAL_ZONE ? 1 : 0
+
+      return {
+        crest: crest * active,
+        foam: Math.min(1, (crest * 1.2 + backwash * 0.42) * zone * peel) * active,
+        lift: crest * zone * (0.55 + peel * 0.7) * active,
+        pitch: (crest * 0.9 - backwash * 0.28) * zone * peel * active,
+        peel
+      }
+    }
 
     // ===================================================================
     // GERSTNER WAVE COMPONENTS
@@ -320,9 +342,13 @@
           dz -= steep * amp * w.dz * c;
         }
 
-        arr[i3]     = wx + dx;
-        arr[i3 + 1] = dy;
-        arr[i3 + 2] = bz + dz;
+        const breaker = getBreaker(wx, wz, distToShore, time, BREAK_ZONE)
+        dy += breaker.lift * CONFIG.waveHeight
+        dz += breaker.pitch * CONFIG.waveHeight
+
+        arr[i3]     = wx + dx
+        arr[i3 + 1] = dy
+        arr[i3 + 2] = bz + dz
       }
 
       posAttr.needsUpdate = true;
@@ -333,53 +359,30 @@
       const fArr = fPos.array;
       const fCol = foamGeo.attributes.color.array;
       const BREAK = CONFIG.breakDistance;
-      let maxA = 0;
       for (let i = 0; i < vertCount; i++) {
         const i3 = i * 3;
         const wx = basePositions[i3];
         const bz = basePositions[i3 + 2];
         const wz = bz + water.position.z;
         const dist = SHORELINE_Z - wz;
-        const t = Math.max(0, Math.min(1, dist / BREAK));
-        const alpha = (dist > 0 && dist < BREAK) ? (1 - t) * 0.85 : 0;
-        maxA = Math.max(maxA, alpha);
-        const roll = (dist > 0 && dist < BREAK) ? (1 - t) * 1.4 : 0;
+        const breaker = getBreaker(wx, wz, dist, time, BREAK)
+        const shoreFoam = dist > 0 && dist < BREAK * 0.75
+          ? (1 - dist / (BREAK * 0.75)) * 0.3
+          : 0
+        const alpha = Math.min(1, breaker.foam + shoreFoam)
 
-        // amplitude & steepness in break zone
-        let fAmp = 1.0, fSteep = 0.0;
-        if (dist >= SHOAL_ZONE) {
-          fAmp = 1; fSteep = 0;
-        } else if (dist >= BREAK) {
-          const tt = 1 - (dist - BREAK) / (SHOAL_ZONE - BREAK);
-          fAmp = 1 + (SHOAL_BOOST-1)*tt; fSteep = tt*0.4;
-        } else if (dist > 0) {
-          const tt = dist / BREAK;
-          fAmp = SHOAL_BOOST * Math.pow(tt, 0.6);
-          fSteep = 0.5 + (1-tt)*1.2;
-        } else { fAmp = 0; }
-        fAmp *= CONFIG.waveHeight;
+        fArr[i3] = arr[i3]
+        fArr[i3 + 1] = arr[i3 + 1] + 0.1 + alpha * 0.08
+        fArr[i3 + 2] = arr[i3 + 2] + breaker.pitch * 0.18
 
-        let fdx=0, fdz=0;
-        for (const w of WAVES) {
-          const freq = w.f * CONFIG.waveFrequency;
-          const amp  = w.a * fAmp;
-          const speed = w.s * CONFIG.waveSpeed;
-          const steep = Math.min(w.st * (1 + fSteep), 0.95);
-          const dot = w.dx * wx + w.dz * wz;
-          const ph = freq * dot - time * 0.9 * speed;
-          const c = Math.cos(ph);
-          fdx -= steep * amp * w.dx * c;
-          fdz -= steep * amp * w.dz * c;
-        }
-        fArr[i3]     = wx + fdx;
-        fArr[i3 + 2] = bz + fdz + roll;
-
-        fCol[i3] = fCol[i3+1] = fCol[i3+2] = alpha;
+        fCol[i3] = alpha
+        fCol[i3 + 1] = alpha * 0.98
+        fCol[i3 + 2] = alpha * 0.92
       }
-      foamMat.opacity = maxA;
-      fPos.needsUpdate = true;
-      foamGeo.attributes.color.needsUpdate = true;
-      foamGeo.computeVertexNormals();
+      foamTex.offset.x = -time * CONFIG.waveSpeed * 0.025
+      foamTex.offset.y = time * CONFIG.waveSpeed * 0.04
+      fPos.needsUpdate = true
+      foamGeo.attributes.color.needsUpdate = true
 
       controls.update();
       renderer.render(scene, camera);
@@ -413,11 +416,11 @@
 
     window.addEventListener('keydown', e => {
       if (e.key === 'r' || e.key === 'R') {
-        [sH,sS,sF,sB].forEach(s => s.value = s===sB?'3':'1');
+        [sH,sS,sF,sB].forEach(s => s.value = s===sB?'7':'1');
         CONFIG.waveHeight = CONFIG.waveSpeed = CONFIG.waveFrequency = 1.0;
-        CONFIG.breakDistance = 3.0;
+        CONFIG.breakDistance = 7.0;
         vH.textContent = vS.textContent = vF.textContent = '1.00';
-        vB.textContent = '3.0';
+        vB.textContent = '7.0';
       }
     });
 
